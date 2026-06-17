@@ -151,13 +151,48 @@ def fake_predict(date: datetime.date, scenario: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# What-if predictor — rule-based scoring from field conditions
+# ---------------------------------------------------------------------------
+
+def whatif_predict(temp_c: float, ice_cm: float, snow_pct: float, cold_days: int):
+    """Returns (state, condition_score 0–100) from manually-entered field variables."""
+    score = 0.0
+    # Ice thickness: up to 40 pts (100 cm → full points)
+    score += min(40.0, ice_cm * 40.0 / 100.0)
+    # Temperature: up to 30 pts; -20°C → 30pts, 0°C → ~7pts, +10°C → 0pts
+    score += max(0.0, min(30.0, (-temp_c + 10.0) * 30.0 / 45.0))
+    # Snow cover: up to 15 pts
+    score += snow_pct * 15.0 / 100.0
+    # Consecutive cold days: up to 15 pts
+    score += cold_days * 15.0 / 90.0
+
+    if score >= 62:
+        return "Frozen", score
+    elif score >= 30:
+        return "Unstable", score
+    else:
+        return "Open", score
+
+
+# ---------------------------------------------------------------------------
 # Map builder
 # ---------------------------------------------------------------------------
 
-def build_map(df: pd.DataFrame, date: datetime.date, scenario: str) -> folium.Map:
-    m = folium.Map(location=[52.5, -89.5], zoom_start=6, tiles="CartoDB positron")
+def build_map(df: pd.DataFrame, date: datetime.date, scenario: str,
+              focus_community: str = None) -> folium.Map:
+    center = [52.5, -89.5]
+    zoom = 6
+
+    if focus_community:
+        fc = df[df["name"] == focus_community]
+        if not fc.empty:
+            center = [float(fc.iloc[0]["lat"]), float(fc.iloc[0]["lon"])]
+            zoom = 9
+
+    m = folium.Map(location=center, zoom_start=zoom, tiles="CartoDB positron")
 
     for _, row in df.iterrows():
+        is_focused = bool(focus_community and row["name"] == focus_community)
         color = STATE_COLOR[row["state"]]
         emoji = STATE_EMOJI[row["state"]]
 
@@ -181,14 +216,25 @@ def build_map(df: pd.DataFrame, date: datetime.date, scenario: str) -> folium.Ma
         </div>
         """
 
+        # Outer ring highlight for the focused marker
+        if is_focused:
+            folium.CircleMarker(
+                location=[row["lat"], row["lon"]],
+                radius=22,
+                color="#FFD700",
+                weight=2.5,
+                fill=False,
+                opacity=0.85,
+            ).add_to(m)
+
         folium.CircleMarker(
             location=[row["lat"], row["lon"]],
-            radius=11,
-            color="white",
-            weight=1.5,
+            radius=16 if is_focused else 11,
+            color="#FFD700" if is_focused else "white",
+            weight=3 if is_focused else 1.5,
             fill=True,
             fill_color=color,
-            fill_opacity=0.88,
+            fill_opacity=0.95 if is_focused else 0.88,
             popup=folium.Popup(popup_html, max_width=280),
             tooltip=f"{row['name']} — {row['state']} (Risk {row['risk_score']})",
         ).add_to(m)
@@ -200,7 +246,10 @@ def build_map(df: pd.DataFrame, date: datetime.date, scenario: str) -> folium.Ma
 # Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.title("⚙️ Settings")
+    st.title("⚙️ Controls")
+
+    # --- Forecast settings ---
+    st.subheader("Forecast")
     forecast_date = st.date_input(
         "Forecast Date",
         value=datetime.date(2027, 1, 15),
@@ -208,6 +257,59 @@ with st.sidebar:
         max_value=datetime.date(2035, 12, 31),
     )
     scenario = st.selectbox("Climate Scenario", SCENARIOS, index=1)
+
+    st.divider()
+
+    # --- Lake / Community Search ---
+    st.subheader("🔍 Find Lake")
+
+    # Options show "Community  ·  Lake" so both names are searchable by typing
+    search_options = {f"{c['name']}  ·  {c['lake']}": c["name"] for c in COMMUNITIES}
+    search_list = [""] + list(search_options.keys())
+
+    selected_label = st.selectbox(
+        "Find lake or community",
+        search_list,
+        index=0,
+        format_func=lambda x: "— type to search —" if x == "" else x,
+        label_visibility="collapsed",
+    )
+
+    focus_community = search_options.get(selected_label)  # None when placeholder
+
+    if focus_community:
+        fc_meta = next(c for c in COMMUNITIES if c["name"] == focus_community)
+        st.caption(f"📍 {fc_meta['lake']}")
+
+    st.divider()
+
+    # --- What-if Ice Condition Predictor ---
+    st.subheader("🧪 Ice Condition Predictor")
+    st.caption("Enter current field conditions to estimate lake state.")
+
+    wi_temp = st.slider("Air Temperature (°C)", -35.0, 10.0, -10.0, 0.5,
+                        format="%.1f °C")
+    wi_ice = st.slider("Ice Thickness (cm)", 0, 130, 60, 5,
+                       format="%d cm")
+    wi_snow = st.slider("Snow Cover (%)", 0, 100, 60, 5,
+                        format="%d %%")
+    wi_cold_days = st.slider("Consecutive Cold Days", 0, 90, 30, 5,
+                             format="%d days")
+
+    wi_state, wi_score = whatif_predict(wi_temp, wi_ice, wi_snow, wi_cold_days)
+    wi_color = STATE_COLOR[wi_state]
+    wi_emoji = STATE_EMOJI[wi_state]
+
+    st.markdown(
+        f'<div style="background:{wi_color};color:white;padding:10px 12px;'
+        f'border-radius:8px;text-align:center;font-size:1.05em;font-weight:bold;'
+        f'margin-top:6px;">'
+        f'{wi_emoji} &nbsp;Predicted: <span style="font-size:1.15em">{wi_state}</span>'
+        f'<br><span style="font-size:0.72em;opacity:0.9;font-weight:normal;">'
+        f'Condition score: {wi_score:.0f} / 100</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
     st.divider()
     st.subheader("Legend")
@@ -244,20 +346,26 @@ df = fake_predict(forecast_date, scenario)
 col_map, col_detail = st.columns([3, 1], gap="medium")
 
 with col_map:
-    m = build_map(df, forecast_date, scenario)
+    m = build_map(df, forecast_date, scenario, focus_community)
     map_result = st_folium(m, width="100%", height=620, returned_objects=["last_object_clicked"])
 
 with col_detail:
     st.subheader("Community Detail")
 
-    # Match clicked marker to nearest community
-    clicked = (map_result or {}).get("last_object_clicked")
+    # Search selection takes precedence; fall back to map click
     selected = None
-    if clicked:
-        clat, clon = clicked.get("lat"), clicked.get("lng")
-        if clat is not None and clon is not None:
-            dist = df.apply(lambda r: abs(r.lat - clat) + abs(r.lon - clon), axis=1)
-            selected = df.iloc[dist.idxmin()]
+
+    if focus_community:
+        rows = df[df["name"] == focus_community]
+        if not rows.empty:
+            selected = rows.iloc[0]
+    else:
+        clicked = (map_result or {}).get("last_object_clicked")
+        if clicked:
+            clat, clon = clicked.get("lat"), clicked.get("lng")
+            if clat is not None and clon is not None:
+                dist = df.apply(lambda r: abs(r.lat - clat) + abs(r.lon - clon), axis=1)
+                selected = df.iloc[dist.idxmin()]
 
     if selected is not None:
         color = STATE_COLOR[selected["state"]]
@@ -273,10 +381,10 @@ with col_detail:
         st.metric("Risk Score", f"{selected['risk_score']} / 100")
         st.divider()
         col_a, col_b = st.columns(2)
-        col_a.metric("Ice (cm)",   f"{selected['ice_thickness_cm']}")
-        col_b.metric("Snow (%)",   f"{selected['snow_cover_pct']}")
+        col_a.metric("Ice (cm)",    f"{selected['ice_thickness_cm']}")
+        col_b.metric("Snow (%)",    f"{selected['snow_cover_pct']}")
         col_a.metric("Temp Δ (°C)", f"{selected['temp_anomaly_c']:+.2f}")
-        col_b.metric("Road days",  f"{selected['road_open_days']}")
+        col_b.metric("Road days",   f"{selected['road_open_days']}")
     else:
         st.info("Click a community on the map to see its detail.")
 
@@ -309,12 +417,13 @@ display_cols = {
 }
 table_df = df[list(display_cols)].rename(columns=display_cols).sort_values("Risk Score", ascending=False)
 
-# Highlight rows by state using pandas Styler
 BG = {"Frozen": "#dbeeff", "Unstable": "#fff3cd", "Open": "#ffe0e0"}
+
 
 def highlight_state(row):
     color = BG.get(row["State"], "")
     return [f"background-color:{color}" for _ in row]
+
 
 styled = table_df.style.apply(highlight_state, axis=1).format(
     {"Risk Score": "{:.1f}", "Ice (cm)": "{:.1f}",
