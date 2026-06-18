@@ -6,6 +6,8 @@ Fake predictions are used until the real MLP model (ice_model.pkl) is connected.
 
 import datetime
 import hashlib
+import requests
+from concurrent.futures import ThreadPoolExecutor
 
 import folium
 import numpy as np
@@ -102,6 +104,8 @@ SCENARIO_SHIFT = {
     "High Emissions (SSP5-8.5)": [-0.08,  0.00,  0.08],
 }
 
+FORECAST_WINDOW = 7  # days ahead the Open-Meteo free tier provides
+
 # ---------------------------------------------------------------------------
 # Fake prediction engine
 # Deterministic per (community, year, scenario) using MD5 seeding so results
@@ -151,20 +155,141 @@ def fake_predict(date: datetime.date, scenario: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Real-time weather — Open-Meteo (free, no API key required)
+# Fetches today ± 7 days forecast + 92 days of history for cum-FDD calculation.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_all_weather(today_iso: str) -> dict:
+    """Fetch daily forecast + history for all 30 communities in parallel."""
+    def _one(c):
+        try:
+            r = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": c["lat"],
+                    "longitude": c["lon"],
+                    "daily": [
+                        "temperature_2m_mean",
+                        "windspeed_10m_max",
+                        "precipitation_sum",
+                        "snowfall_sum",
+                        "snow_depth",
+                    ],
+                    "wind_speed_unit": "ms",
+                    "timezone": "America/Toronto",
+                    "past_days": 92,
+                    "forecast_days": FORECAST_WINDOW,
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            return c["name"], r.json()
+        except Exception:
+            return c["name"], None
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        for name, data in pool.map(_one, COMMUNITIES):
+            results[name] = data
+    return results
+
+
+def _cum_fdd(daily: dict, up_to: datetime.date) -> float:
+    """Sum freezing degree-days from Oct 1 of the current freeze season up to `up_to`."""
+    year = up_to.year if up_to.month >= 10 else up_to.year - 1
+    season_start = datetime.date(year, 10, 1)
+    fdd = 0.0
+    for d_str, t in zip(daily.get("time", []), daily.get("temperature_2m_mean", [])):
+        d = datetime.date.fromisoformat(d_str)
+        if d < season_start:
+            continue
+        if d > up_to:
+            break
+        if t is not None and t < 0:
+            fdd -= t  # t is negative, so -t adds a positive FDD contribution
+    return round(fdd, 1)
+
+
+def realtime_predict(weather_cache: dict, target_date: datetime.date, scenario: str):
+    """Build a prediction DataFrame from live weather data.
+    Falls back to fake_predict for any community where the fetch failed."""
+    _fake_df = None
+    rows = []
+    n_failed = 0
+
+    for c in COMMUNITIES:
+        data = weather_cache.get(c["name"])
+        row = None
+
+        if data is not None:
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])
+            target_iso = target_date.isoformat()
+
+            if target_iso in dates:
+                idx = dates.index(target_iso)
+                temp_c        = daily["temperature_2m_mean"][idx] or 0.0
+                wind_ms       = daily["windspeed_10m_max"][idx] or 0.0
+                precip_mm     = daily["precipitation_sum"][idx] or 0.0
+                snow_depth_cm = (daily.get("snow_depth", [None] * len(dates))[idx] or 0.0) * 100.0
+                cum_fdd_val   = _cum_fdd(daily, target_date)
+
+                state, score = whatif_predict(temp_c, wind_ms, snow_depth_cm, precip_mm, cum_fdd_val)
+                lo, hi = {"Frozen": (5, 35), "Unstable": (40, 70), "Open": (65, 95)}[state]
+                risk = round(lo + (score / 100.0) * (hi - lo), 1)
+                # Stefan's-law ice thickness estimate: h_cm ≈ 3.4 × sqrt(FDD)
+                ice_cm = round(min(130.0, 3.4 * (max(0.0, cum_fdd_val) ** 0.5)), 1)
+
+                row = {
+                    **c,
+                    "state":            state,
+                    "risk_score":       risk,
+                    "ice_thickness_cm": ice_cm,
+                    "temp_anomaly_c":   round(temp_c - (-15.0), 2),
+                    "snow_cover_pct":   min(100.0, round(snow_depth_cm, 1)),
+                    "road_open_days":   {"Frozen": 70, "Unstable": 25, "Open": 5}[state],
+                    # Live weather fields shown in popup
+                    "rt_temp_c":        round(temp_c, 1),
+                    "rt_wind_ms":       round(wind_ms, 1),
+                    "rt_precip_mm":     round(precip_mm, 1),
+                    "rt_snow_depth_cm": round(snow_depth_cm, 1),
+                    "rt_cum_fdd":       cum_fdd_val,
+                }
+
+        if row is None:
+            n_failed += 1
+            if _fake_df is None:
+                _fake_df = fake_predict(target_date, scenario)
+            fake_row = _fake_df[_fake_df["name"] == c["name"]].iloc[0].to_dict()
+            fake_row["rt_temp_c"] = None  # marks this as a fallback row
+            row = fake_row
+
+        rows.append(row)
+
+    return pd.DataFrame(rows), n_failed
+
+
+# ---------------------------------------------------------------------------
 # What-if predictor — rule-based scoring from field conditions
 # ---------------------------------------------------------------------------
 
-def whatif_predict(temp_c: float, ice_cm: float, snow_pct: float, cold_days: int):
-    """Returns (state, condition_score 0–100) from manually-entered field variables."""
+def whatif_predict(temp_c: float, wind_ms: float, snow_depth_cm: float,
+                   precip_mm: float, cum_fdd: float):
+    """Returns (state, condition_score 0–100) from ERA5-style meteorological inputs."""
     score = 0.0
-    # Ice thickness: up to 40 pts (100 cm → full points)
-    score += min(40.0, ice_cm * 40.0 / 100.0)
-    # Temperature: up to 30 pts; -20°C → 30pts, 0°C → ~7pts, +10°C → 0pts
-    score += max(0.0, min(30.0, (-temp_c + 10.0) * 30.0 / 45.0))
-    # Snow cover: up to 15 pts
-    score += snow_pct * 15.0 / 100.0
-    # Consecutive cold days: up to 15 pts
-    score += cold_days * 15.0 / 90.0
+    # Cumulative FDD: Stefan's-law driver of ice growth, up to 50 pts
+    score += min(50.0, cum_fdd * 50.0 / 400.0)
+    # Air temperature: up to 25 pts; -30°C → ~25 pts, 0°C → ~5.5 pts, +10°C → 0 pts
+    score += max(0.0, min(25.0, (-temp_c + 10.0) * 25.0 / 45.0))
+    # Snow depth: insulation slows melt, up to 15 pts
+    score += min(15.0, snow_depth_cm * 15.0 / 100.0)
+    # Wind: surface turbulence destabilises forming ice, up to -10 pts
+    score -= min(10.0, wind_ms * 10.0 / 20.0)
+    # Precipitation: rainfall accelerates melt, up to -10 pts
+    score -= min(10.0, precip_mm * 10.0 / 20.0)
+
+    score = max(0.0, min(100.0, score))
 
     if score >= 62:
         return "Frozen", score
@@ -205,14 +330,30 @@ def build_map(df: pd.DataFrame, date: datetime.date, scenario: str,
           <b style="color:{color};">&nbsp;{row['state']}</b>
           &nbsp;· Risk&nbsp;<b>{row['risk_score']}/100</b>
           <hr style="margin:6px 0;">
-          <table style="width:100%;border-collapse:collapse;">
+          <table style="width:100%;border-collapse:collapse;">"""
+
+        has_rt = "rt_temp_c" in row.index and row["rt_temp_c"] is not None
+        if has_rt:
+            popup_html += f"""
+            <tr><td>Air temp</td><td align="right"><b>{row['rt_temp_c']} °C</b></td></tr>
+            <tr><td>Wind speed</td><td align="right"><b>{row['rt_wind_ms']} m/s</b></td></tr>
+            <tr><td>Snow depth</td><td align="right"><b>{row['rt_snow_depth_cm']} cm</b></td></tr>
+            <tr><td>Precipitation</td><td align="right"><b>{row['rt_precip_mm']} mm</b></td></tr>
+            <tr><td>Cum. FDD</td><td align="right"><b>{row['rt_cum_fdd']}</b></td></tr>
+            <tr><td>Est. ice (Stefan)</td><td align="right"><b>{row['ice_thickness_cm']} cm</b></td></tr>"""
+            data_badge = '<span style="color:#2e7d32;font-weight:bold;">⬤ Live · Open-Meteo</span>'
+        else:
+            popup_html += f"""
             <tr><td>Ice thickness</td><td align="right"><b>{row['ice_thickness_cm']} cm</b></td></tr>
             <tr><td>Temp anomaly</td><td align="right"><b>{row['temp_anomaly_c']:+.2f}°C</b></td></tr>
             <tr><td>Snow cover</td><td align="right"><b>{row['snow_cover_pct']}%</b></td></tr>
-            <tr><td>Est. road-open days</td><td align="right"><b>{row['road_open_days']}</b></td></tr>
+            <tr><td>Est. road-open days</td><td align="right"><b>{row['road_open_days']}</b></td></tr>"""
+            data_badge = f'<span style="color:#999;">{date.strftime("%b %d, %Y")} · {scenario}</span>'
+
+        popup_html += f"""
           </table>
           <hr style="margin:6px 0;">
-          <span style="font-size:10px;color:#999;">{date.strftime('%b %d, %Y')} · {scenario}</span>
+          <span style="font-size:10px;">{data_badge}</span>
         </div>
         """
 
@@ -245,6 +386,8 @@ def build_map(df: pd.DataFrame, date: datetime.date, scenario: str,
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+today = datetime.date.today()
+
 with st.sidebar:
     st.title("⚙️ Controls")
 
@@ -257,6 +400,23 @@ with st.sidebar:
         max_value=datetime.date(2035, 12, 31),
     )
     scenario = st.selectbox("Climate Scenario", SCENARIOS, index=1)
+
+    st.divider()
+
+    # --- Real-time mode ---
+    realtime_mode = st.toggle(
+        "🌐 Real-Time Weather",
+        value=False,
+        help="Fetch live forecast data from Open-Meteo (free). "
+             f"Available for today through {(today + datetime.timedelta(days=FORECAST_WINDOW)).strftime('%b %d')}. "
+             "Dates outside this window fall back to the scenario model.",
+    )
+    if realtime_mode:
+        rt_end = today + datetime.timedelta(days=FORECAST_WINDOW)
+        st.caption(
+            f"Live window: **{today.strftime('%b %d')} – {rt_end.strftime('%b %d, %Y')}**  \n"
+            "Data: Open-Meteo · cached 1 h"
+        )
 
     st.divider()
 
@@ -287,16 +447,20 @@ with st.sidebar:
     st.subheader("🧪 Ice Condition Predictor")
     st.caption("Enter current field conditions to estimate lake state.")
 
-    wi_temp = st.slider("Air Temperature (°C)", -35.0, 10.0, -10.0, 0.5,
+    wi_temp = st.slider("Air Temperature (°C)", -35.0, 10.0, -15.0, 0.5,
                         format="%.1f °C")
-    wi_ice = st.slider("Ice Thickness (cm)", 0, 130, 60, 5,
-                       format="%d cm")
-    wi_snow = st.slider("Snow Cover (%)", 0, 100, 60, 5,
-                        format="%d %%")
-    wi_cold_days = st.slider("Consecutive Cold Days", 0, 90, 30, 5,
-                             format="%d days")
+    wi_wind = st.slider("Wind Speed (m/s)", 0.0, 25.0, 5.0, 0.5,
+                        format="%.1f m/s")
+    wi_snow = st.slider("Snow Depth (cm)", 0, 150, 50, 5,
+                        format="%d cm")
+    wi_precip = st.slider("Total Precipitation (mm)", 0.0, 50.0, 0.0, 0.5,
+                          format="%.1f mm",
+                          help="Rainfall equivalent — rain accelerates ice melt")
+    wi_fdd = st.slider("Cumulative Freezing Degree-Days", 0, 600, 200, 10,
+                       format="%d FDD",
+                       help="Accumulated cold since freeze-up; drives ice thickness via Stefan's law")
 
-    wi_state, wi_score = whatif_predict(wi_temp, wi_ice, wi_snow, wi_cold_days)
+    wi_state, wi_score = whatif_predict(wi_temp, wi_wind, wi_snow, wi_precip, wi_fdd)
     wi_color = STATE_COLOR[wi_state]
     wi_emoji = STATE_EMOJI[wi_state]
 
@@ -338,7 +502,26 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Compute predictions
 # ---------------------------------------------------------------------------
-df = fake_predict(forecast_date, scenario)
+rt_end = today + datetime.timedelta(days=FORECAST_WINDOW)
+realtime_active = realtime_mode and (today <= forecast_date <= rt_end)
+
+if realtime_active:
+    with st.spinner("Fetching live weather from Open-Meteo…"):
+        weather_cache = fetch_all_weather(today.isoformat())
+    df, n_failed = realtime_predict(weather_cache, forecast_date, scenario)
+    if n_failed:
+        st.warning(
+            f"{n_failed} of 30 communities fell back to scenario data "
+            "(weather fetch failed — check your connection)."
+        )
+else:
+    if realtime_mode:
+        st.info(
+            f"Real-time data is only available for **{today.strftime('%b %d')} – "
+            f"{rt_end.strftime('%b %d, %Y')}**. "
+            "Showing scenario forecast for the selected date."
+        )
+    df = fake_predict(forecast_date, scenario)
 
 # ---------------------------------------------------------------------------
 # Layout: map (left) + detail panel (right)
@@ -381,10 +564,23 @@ with col_detail:
         st.metric("Risk Score", f"{selected['risk_score']} / 100")
         st.divider()
         col_a, col_b = st.columns(2)
-        col_a.metric("Ice (cm)",    f"{selected['ice_thickness_cm']}")
-        col_b.metric("Snow (%)",    f"{selected['snow_cover_pct']}")
-        col_a.metric("Temp Δ (°C)", f"{selected['temp_anomaly_c']:+.2f}")
-        col_b.metric("Road days",   f"{selected['road_open_days']}")
+        has_rt_detail = (
+            "rt_temp_c" in selected.index
+            and selected["rt_temp_c"] is not None
+        )
+        if has_rt_detail:
+            col_a.metric("Air Temp (°C)",    f"{selected['rt_temp_c']}")
+            col_b.metric("Wind (m/s)",       f"{selected['rt_wind_ms']}")
+            col_a.metric("Snow Depth (cm)",  f"{selected['rt_snow_depth_cm']}")
+            col_b.metric("Precip (mm)",      f"{selected['rt_precip_mm']}")
+            col_a.metric("Cum. FDD",         f"{selected['rt_cum_fdd']}")
+            col_b.metric("Est. Ice (cm)",    f"{selected['ice_thickness_cm']}")
+            st.caption("⬤ Live — Open-Meteo")
+        else:
+            col_a.metric("Ice (cm)",    f"{selected['ice_thickness_cm']}")
+            col_b.metric("Snow (%)",    f"{selected['snow_cover_pct']}")
+            col_a.metric("Temp Δ (°C)", f"{selected['temp_anomaly_c']:+.2f}")
+            col_b.metric("Road days",   f"{selected['road_open_days']}")
     else:
         st.info("Click a community on the map to see its detail.")
 
