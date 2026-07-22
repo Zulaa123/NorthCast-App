@@ -1,4 +1,4 @@
-# NorthCast AI (Temporary README)
+# NorthCast AI 
 
 ## AI4Good Lab Project
 
@@ -48,7 +48,7 @@ streamlit run app.py
 
 ## How Real-Time Forecasting Works
 
-When the **🌐 Real-Time Weather** toggle is enabled and the selected forecast date falls within today + 7 days, the app fetches live weather data and runs it through a physics-based ice condition scorer. Here is how the pipeline works end-to-end.
+When the ** Real-Time Weather** toggle is enabled and the selected forecast date falls within today + 7 days, the app fetches live weather data and runs it through a physics-based ice condition scorer. Here is how the pipeline works end-to-end.
 
 ### 1. Data Fetch — Open-Meteo API
 
@@ -98,7 +98,7 @@ This is the standard empirical formula for black ice growth in still water.
 
 ### 4. Map Display
 
-The resulting predictions drive the same colour-coded circle markers as the scenario mode. When a community has live data, its map popup switches from scenario fields to the actual weather variables (air temp, wind, snow depth, precipitation, cumulative FDD, estimated ice thickness) and shows a green **⬤ Live · Open-Meteo** badge.
+The resulting predictions drive the same colour-coded circle markers as the scenario mode. When a community has live data, its map popup switches from scenario fields to the actual weather variables (air temp, wind, snow depth, precipitation, cumulative FDD, estimated ice thickness) and shows a green ** Live · Open-Meteo** badge.
 
 ### Known Limitations
 
